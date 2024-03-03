@@ -1,0 +1,343 @@
+---
+title: "Covid Data"
+author: "M Bailey"
+date: "2024-03-02"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  fig.align = "center",
+  tidy.opts=list(width.cutoff=50),tidy=TRUE)
+
+
+library(tidyr)
+library(stringr)
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+```
+## Getting Data
+We access the data by getting the four csv names and appending them to the original link. The data is made available by the Johns Hopkins Center for Systems Science and Engineering (CSSE). We are going to look at four datasets in total that we will combine into master dataset containing deaths and cases for the US and abroad.
+```{r get_data, cache = TRUE}
+base_url <-  paste0(
+  "https://raw.githubusercontent.com/",
+  "CSSEGISandData/COVID-19/master/",
+  "csse_covid_19_data/csse_covid_19_time_series/"
+)
+
+csv_names <-  c(
+  "time_series_covid19_confirmed_US.csv",
+  "time_series_covid19_confirmed_global.csv",
+  "time_series_covid19_deaths_US.csv",
+  "time_series_covid19_deaths_global.csv"
+              )
+
+lookup_csv <-  paste0(
+  "https://raw.githubusercontent.com/",
+  "CSSEGISandData/COVID-19/master/",
+  "csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+  )
+
+file_urls = str_c(base_url, csv_names)
+
+us_cases_raw = read_csv(file_urls[1], show_col_types = FALSE)
+global_cases_raw = read_csv(file_urls[2], show_col_types = FALSE)
+us_deaths_raw = read_csv(file_urls[3], show_col_types = FALSE)
+global_deaths_raw = read_csv(file_urls[4], show_col_types = FALSE)
+lookup = read_csv(lookup_csv)
+
+us_cases_raw
+global_cases_raw
+us_deaths_raw
+global_deaths_raw
+```
+In order to get the data into a friendly format, I needed to do some wrangling. This was a good test of my skills, as it wasn't super hard, but I did need to be mindful of joining the global tables by both date and country. After a fairly large amount of tidying and joining (shown below), I ended up with some good tables of data. One important thing to note is that the populations for the countries are static, so this is a decent representation of per capita, but not precise enough for high-accuracy use cases.
+After recognizing the presence of outlier data, I needed to locate and remove the impact of those numbers. My solution in such cases was to remove that row entirely so it would not affect the data. Due to lack of reporting, I drop North Korea, for instance.
+```{r tidy_data, message=FALSE}
+us_cases <- us_cases_raw %>%
+  select(
+    Country_Region,
+    Province_State,
+    12:last_col()) %>%
+  pivot_longer(
+    cols = 3:last_col(),
+    names_to = "date",
+    values_to = "cases") %>%
+  mutate(date = mdy(date)) %>%
+  group_by(`date`, Country_Region) %>%
+  summarize(cases = sum(cases))
+
+global_cases <- global_cases_raw %>%
+  select("Country/Region", 5:last_col()) %>%
+  pivot_longer(
+    cols = 2:last_col(),
+    names_to = "date",
+    values_to = "cases") %>%
+  mutate(date = mdy(date)) %>%
+  filter(!`Country/Region`== "Korea, North") %>%
+  group_by(`date`, `Country/Region`) %>%
+  summarize(cases = sum(cases))
+
+us_deaths <- us_deaths_raw %>%
+  select(Population, 13:last_col()) %>%
+  pivot_longer(
+    cols = 3:last_col(),
+    names_to = "date",
+    values_to = "deaths") %>%
+  mutate(date = mdy(date)) %>%
+  group_by(`date`) %>%
+  summarize(
+    deaths = sum(deaths),
+    population = sum(Population)
+    )
+
+lookup <- lookup %>%
+  select(Combined_Key, Population)
+
+global_deaths_with_pop <- global_deaths_raw %>%
+  inner_join(lookup, by = join_by(`Country/Region` == Combined_Key))
+
+global_deaths <- global_deaths_with_pop %>%
+  select(!c(`Province/State`,Lat, Long)) %>%
+  pivot_longer(
+    cols = 2:last_col(offset = 1),
+    names_to = "date",
+    values_to = "deaths") %>%
+  mutate(date = mdy(date)) %>%
+  group_by(`date`, `Country/Region`, Population) %>%
+  summarize(deaths = sum(deaths)) %>%
+  filter(Population > 0)
+
+all_US_deaths_and_cases <- us_cases %>% inner_join(us_deaths, by = "date")
+
+all_global_deaths_and_cases <- global_cases %>%
+  inner_join(global_deaths, 
+             by = join_by(`Country/Region`, "date")
+             ) %>%
+  rename(
+     population = Population,
+     Country_Region = `Country/Region`
+    )
+
+summary(all_US_deaths_and_cases)
+summary(all_global_deaths_and_cases)
+```
+
+## Data Visualization
+```{r visualize_data}
+all_US_deaths_and_cases %>%
+  ggplot(
+    aes(x = date, y = cases)
+    ) +
+  geom_line(color = "red") +
+  xlab("Year") +
+  labs (title = "US Cases by Year")
+
+all_global_deaths_and_cases %>%
+  group_by(date) %>%
+  summarize(cases = sum(cases)) %>%
+  ggplot(
+    aes(x = date, y = cases)
+  ) +
+  geom_line( color = "red") +
+  xlab("Year") +
+  labs (title = "Global Cases by Year")
+
+```
+## Data Analysis
+There are lots of interesting metrics that can be developed on top of the raw data that can give us a different perspective. For the sake of this project, I decided to add a column for the deaths and cases per 1000 people. After that, I ranked the top 5 and bottom 5 for both of these metrics, and plotted their rise over the duration of the data.
+
+```{r data_analysis}
+all_US_deaths_and_cases <- all_US_deaths_and_cases %>%
+  mutate(
+    cases_per_thousand = (cases / population) * 1000,
+    deaths_per_thousand = (deaths / population) * 1000
+    )
+
+all_global_deaths_and_cases <-
+  all_global_deaths_and_cases %>%
+  ungroup() %>%
+  mutate(
+    cases_per_thousand = (cases / population) * 1000,
+    deaths_per_thousand = (deaths / population) * 1000
+    )
+
+top_five_death_countries <-
+  all_global_deaths_and_cases %>%
+  filter(
+    date == max(all_global_deaths_and_cases$date)) %>%
+  slice_max(
+    order_by = deaths_per_thousand,
+    n = 5
+    ) %>%
+  select(
+    c(Country_Region, deaths_per_thousand, population)
+    )
+
+bottom_five_death_countries <- 
+  all_global_deaths_and_cases %>%
+  filter(
+    date == max(all_global_deaths_and_cases$date)) %>%
+  filter(deaths_per_thousand > 0.01) %>%
+  slice_min(
+    order_by = deaths_per_thousand,
+    n = 5
+    ) %>%
+  select(
+    c(Country_Region, deaths_per_thousand, population)
+    )
+
+top_five_case_countries <-
+  all_global_deaths_and_cases  %>%
+  filter(
+    date == max(all_global_deaths_and_cases$date)) %>%
+  slice_max(
+    order_by = cases_per_thousand,
+    n = 5
+    ) %>%
+  select(
+    c(Country_Region, cases_per_thousand, population)
+    )
+
+bottom_five_case_countries <-
+  all_global_deaths_and_cases  %>%
+  filter(
+    date == max(all_global_deaths_and_cases$date)) %>%
+  filter(cases_per_thousand > 0.01) %>%
+  slice_min(
+    order_by = cases_per_thousand,
+    n = 5
+    ) %>%
+  select(
+    c(Country_Region, cases_per_thousand, population)
+    )
+```
+
+```{r case_analysis_plot, fig.show="hold", out.width="48%", fig.height = 5}
+# Top Five Case Plot
+all_global_deaths_and_cases %>%
+  filter(
+    Country_Region ==
+      top_five_case_countries$Country_Region[1] |
+    Country_Region ==
+      top_five_case_countries$Country_Region[2] |
+    Country_Region ==
+      top_five_case_countries$Country_Region[3] |
+    Country_Region ==
+      top_five_case_countries$Country_Region[4] |
+    Country_Region ==
+      top_five_case_countries$Country_Region[5]
+    ) %>%
+  ggplot(
+    aes(x = date, y = cases_per_thousand)
+    ) +
+  geom_line(aes(color = Country_Region)) +
+  xlab("Year") +
+  labs (title = "Top 5 Cases Per 1000 by Year")
+
+# Bottom 5 Case Plot
+all_global_deaths_and_cases %>%
+  filter(
+    Country_Region ==
+      bottom_five_case_countries$Country_Region[1] |
+    Country_Region ==
+      bottom_five_case_countries$Country_Region[2] |
+    Country_Region ==
+      bottom_five_case_countries$Country_Region[3] |
+    Country_Region ==
+      bottom_five_case_countries$Country_Region[4] |
+    Country_Region ==
+      bottom_five_case_countries$Country_Region[5]
+    ) %>%
+  ggplot(
+    aes(x = date, y = cases_per_thousand)
+  ) +
+  geom_line(aes(color = Country_Region)) +
+  xlab("Year") +
+  labs (title = "Bottom 5 Cases Per 1000 by Year")
+```
+```{r death_analysis_plot, fig.show="hold", out.width="48%", fig.height = 5}
+#Top 5 Death Plot
+all_global_deaths_and_cases %>%
+  filter(
+    Country_Region ==
+      top_five_death_countries$Country_Region[1] |
+    Country_Region ==
+      top_five_death_countries$Country_Region[2] |
+    Country_Region ==
+      top_five_death_countries$Country_Region[3] |
+    Country_Region ==
+      top_five_death_countries$Country_Region[4] |
+    Country_Region ==
+      top_five_death_countries$Country_Region[5]
+    ) %>%
+  ggplot(
+    aes(x = date, y = deaths_per_thousand)
+  ) +
+  geom_line(aes(color = Country_Region)) +
+  xlab("Year") +
+  labs (title = "Top 5 Deaths Per 1000 by Year")
+
+# Bottom 5 Death Plot
+all_global_deaths_and_cases %>%
+  filter(
+    Country_Region ==
+      bottom_five_death_countries$Country_Region[1] |
+    Country_Region ==
+      bottom_five_death_countries$Country_Region[2] |
+    Country_Region ==
+      bottom_five_death_countries$Country_Region[3] |
+    Country_Region ==
+      bottom_five_death_countries$Country_Region[4] |
+    Country_Region ==
+      bottom_five_death_countries$Country_Region[5]
+    ) %>%
+  ggplot(
+    aes(x = date, y = deaths_per_thousand)
+  ) +
+  geom_line(aes(color = Country_Region)) +
+  xlab("Year") +
+  labs (title = "Bottom 5 Deaths Per 1000 by Year")
+```
+## Data Model - Predicting Deaths By Cases in US
+| I decided to model the aggregate USA data to find a relationship between cases and deaths. This was done via a simple linear model, assuming that there's a certain fixed rate of lethality over a population. I think this model fails to be more accurate because it does not account for the appearance of new, less lethal variants of Covid.
+```{r model}
+mod = lm(deaths_per_thousand ~ cases_per_thousand - 1, data = all_US_deaths_and_cases, )
+
+x_max = max(all_US_deaths_and_cases$cases)
+x_min = 1
+x_points = x_min:x_max
+
+all_US_deaths_and_cases <- all_US_deaths_and_cases %>%
+  ungroup() %>%
+  mutate(predicted_deaths = predict(mod))
+
+all_US_deaths_and_cases %>%
+  ggplot(
+    aes(x = date)
+  ) + geom_point(
+    aes(
+      y = deaths_per_thousand,
+      color = "deaths_per_thousand"
+      )
+    ) +
+  geom_line(
+    aes(
+      y = predicted_deaths,
+      color = "predicted_deaths"
+    )
+  )
+```
+## Bias Identification and Conlcusion
+|   So this concludes my analysis of the covid data published by Johns Hopkins. Before concluding, I would like to address some of the main biases. The most glaring example would be reporting bias. Some countries clearly didn't report accurately (looking at you, North Korea), others seem to stop reporting (reference the bottom 5 cases graph), which results in a flat line of cases. These were the main issues I encountered with my data.
+|   Most of the data wasn't particularly surprising since the covid pandemic was covered so widely. One fun suspicion to confirm was that people stopped caring in 2022 and it shows, as there were massive spikes in both the largest and smallest nations righ around the turn of that year. Despite that, it appears the 2022 was less lethal, probably due to the less lethal variant spreading at that time.
+|   It's always fun to play with data pertaining to an event you experienced, as it allows you to confirm or debunk views you held about that particular experience. This concludes my report on Covid data from Johns Hopkins, thank you for reading!
+
+## Session Info
+```{r session_info, echo = TRUE}
+sessionInfo()
+```
